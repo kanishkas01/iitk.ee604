@@ -122,7 +122,7 @@ def mean_depth(depth, lt_p, rb_p):
 # -----------------------------------------------------------
 # Streamlit App
 # -----------------------------------------------------------
-st.title("3D Object Measurement (Width, Length, Depth)")
+st.title("EE604 3D Object Measurement (Width, Length, Depth)")
 
 uploaded_file = st.file_uploader("Upload Image", type=["jpg", "png", "jpeg"])
 col1, col2, col3 = st.columns(3)
