@@ -1,57 +1,16 @@
-# refactored_depth_measurement.py
-# Works in Colab or local Python (with display fallbacks).
-# Usage: either call run_pipeline(...) with appropriate args, or run interactively.
-
-import os
-import sys
-import math
-import argparse
+import streamlit as st
 import cv2
 import numpy as np
+import torch
 import matplotlib.pyplot as plt
 from PIL import Image
+from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 from scipy.ndimage import gaussian_filter1d
 from sklearn.cluster import KMeans
-import torch
 
-# Optional Colab-friendly display
-def in_colab():
-    return 'google.colab' in sys.modules
-
-if in_colab():
-    from google.colab.patches import cv2_imshow
-    def show(img, title=None):
-        cv2_imshow(img)
-else:
-    def show(img, title=None):
-        # Use matplotlib for consistent display in notebooks / scripts
-        if img.ndim == 3:
-            plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        else:
-            plt.imshow(img, cmap='gray')
-        if title:
-            plt.title(title)
-        plt.axis('off')
-        plt.show()
-
-# --- Utilities and safer helpers ---
-def load_image(path):
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Image not found: {path}")
-    img = cv2.imread(path)
-    if img is None:
-        raise IOError(f"cv2 failed to read image: {path}")
-    return img
-
-def safe_good_features(mask, max_corners=10, quality=0.05, min_dist=50):
-    """Return Nx1x2 int32 corners or None safely."""
-    if mask is None or mask.size == 0:
-        return None
-    corners = cv2.goodFeaturesToTrack(mask, maxCorners=max_corners,
-                                      qualityLevel=quality, minDistance=min_dist)
-    if corners is None:
-        return None
-    return np.int32(corners)
+# ---------------------------
+# Helper Functions
+# ---------------------------
 
 def small_area_remover(binary):
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
@@ -63,76 +22,187 @@ def small_area_remover(binary):
     return output
 
 def merge_colinear_lines(lines, angle_threshold=5, distance_threshold=20):
-    """Merge and extend colinear line segments. Returns list of [x1,y1,x2,y2]."""
     if lines is None:
         return []
-    # normalize to list of 4-tuples
-    lines_flat = []
-    for l in lines:
-        if isinstance(l, np.ndarray) and l.shape[-1] == 4:
-            x1,y1,x2,y2 = l.reshape(-1)
-        elif isinstance(l, (list,tuple)) and len(l) == 4:
-            x1,y1,x2,y2 = l
-        else:
-            # Hough returns [[x1,y1,x2,y2]] maybe
-            arr = np.array(l).reshape(-1)
-            if arr.size >= 4:
-                x1,y1,x2,y2 = arr[:4]
-            else:
-                continue
-        lines_flat.append([int(x1),int(y1),int(x2),int(y2)])
-
-    merged = []
-    def angle(line):
-        x1,y1,x2,y2 = line
-        return math.degrees(math.atan2(y2-y1, x2-x1))
-
-    def endpoint_min_dist(l1, l2):
-        pts1 = [(l1[0],l1[1]),(l1[2],l1[3])]
-        pts2 = [(l2[0],l2[1]),(l2[2],l2[3])]
-        dmin = min(math.hypot(x1-x2,y1-y2) for (x1,y1) in pts1 for (x2,y2) in pts2)
-        return dmin
-
-    for ln in lines_flat:
-        merged_flag = False
-        a1 = angle(ln)
-        for i, m in enumerate(merged):
-            a2 = angle(m)
-            if abs((a1 - a2)) < angle_threshold and endpoint_min_dist(ln, m) < distance_threshold:
-                # combine endpoints
-                xs = [ln[0], ln[2], m[0], m[2]]
-                ys = [ln[1], ln[3], m[1], m[3]]
-                # choose extremal endpoints along main direction
-                if abs(max(xs) - min(xs)) >= abs(max(ys) - min(ys)):
-                    idx_min = xs.index(min(xs))
-                    idx_max = xs.index(max(xs))
+    merged_lines = []
+    def line_angle(l):
+        x1, y1, x2, y2 = l
+        return np.degrees(np.arctan2(y2 - y1, x2 - x1))
+    def endpoint_distance(l1, l2):
+        x11, y11, x12, y12 = l1
+        x21, y21, x22, y22 = l2
+        dists = [
+            np.hypot(x11 - x21, y11 - y21),
+            np.hypot(x11 - x22, y11 - y22),
+            np.hypot(x12 - x21, y12 - y21),
+            np.hypot(x12 - x22, y12 - y22)
+        ]
+        return np.min(dists)
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        merged = False
+        for i, mline in enumerate(merged_lines):
+            if abs(line_angle(line[0]) - line_angle(mline)) < angle_threshold and endpoint_distance(line[0], mline) < distance_threshold:
+                pts = np.array([[x1,y1],[x2,y2],[mline[0],mline[1]],[mline[2],mline[3]]])
+                x_coords, y_coords = pts[:,0], pts[:,1]
+                if abs(x_coords[0]-x_coords[1]) > abs(y_coords[0]-y_coords[1]):
+                    idx_min, idx_max = np.argmin(x_coords), np.argmax(x_coords)
                 else:
-                    idx_min = ys.index(min(ys))
-                    idx_max = ys.index(max(ys))
-                merged[i] = [xs[idx_min], ys[idx_min], xs[idx_max], ys[idx_max]]
-                merged_flag = True
+                    idx_min, idx_max = np.argmin(y_coords), np.argmax(y_coords)
+                merged_lines[i] = [x_coords[idx_min], y_coords[idx_min], x_coords[idx_max], y_coords[idx_max]]
+                merged = True
                 break
-        if not merged_flag:
-            merged.append(ln)
-    return merged
+        if not merged:
+            merged_lines.append([x1, y1, x2, y2])
+    return merged_lines
 
-# --- SAD / view / measurement helpers (kept from your original logic, but safer) ---
-def sad(camheight, depthmap_bgr, mask, viewport=[3.4,3.6], f=6.5):
-    """Return bounding dx,dy and bounding box from mask area using features+Hough lines.
-       depthmap_bgr: colorized depth image (BGR)
-       mask: single-channel binary mask (0/255)
-    """
-    if mask is None:
-        raise ValueError("Mask is None in sad()")
-    # ensure binary
-    bin_mask = np.where(mask>0, 255, 0).astype(np.uint8)
-    corners = safe_good_features(bin_mask, max_corners=10, quality=0.05, min_dist=30)
-    if corners is None or len(corners) == 0:
-        # fallback to boundingRect of mask
-        ys, xs = np.where(bin_mask>0)
-        if len(xs) == 0:
-            raise ValueError("Mask empty in sad()")
-        x_min, x_max = xs.min(), xs.max()
-        y_min, y_max = ys.min(), ys.max()
+def sad(camheight, depthmap, mask, viewport=[3.4, 3.6], f=6.5, imgsize=None):
+    gray_img = cv2.cvtColor(depthmap, cv2.COLOR_BGR2GRAY)
+    corners = cv2.goodFeaturesToTrack(mask, 10, 0.05, 50)
+    if corners is None:
+        return [0, 0, (0, 0), (0, 0)]
+    corners = np.int32(corners)
+    x_min = np.min(corners[:, :, 0])
+    y_min = np.min(corners[:, :, 1])
+    x_max = np.max(corners[:, :, 0])
+    y_max = np.max(corners[:, :, 1])
+    dx, dy = x_max - x_min, y_max - y_min
+    return [dx, dy, (x_min, y_min), (x_max, y_max)]
+
+# ✅ Fixed version
+def view(dx, dy, img_width, img_height, camh=300, cx=0.82, cy=0.79, f=6.5, viewport=[3.6, 6.4]):
+    """Corrected: uses image width for dx, image height for dy."""
+    v_view = viewport[0]  # vertical real span
+    h_view = viewport[1]  # horizontal real span
+    tx = (dx / float(img_width)) * h_view
+    ty = (dy / float(img_height)) * v_view
+    x = (camh / f) * tx
+    y = (camh / f) * ty
+    return [(cx) * x, (cy) * y]
+
+def vertical_text(img, text, org, font=cv2.FONT_HERSHEY_SIMPLEX, scale=1, color=(0,255,0),
+                  thickness=3, lineType=cv2.LINE_AA, angle=90):
+    x, y = org
+    img_out = img.copy()
+    (text_w, text_h), baseline = cv2.getTextSize(text, font, scale, thickness)
+    text_img = np.zeros((text_h + baseline, text_w, 3), dtype=np.uint8)
+    cv2.putText(text_img, text, (0, text_h), font, scale, color, thickness, lineType)
+    M = cv2.getRotationMatrix2D((text_w//2, text_h//2), angle, 1.0)
+    rotated = cv2.warpAffine(text_img, M, (text_h, text_w), flags=cv2.INTER_LINEAR)
+    h, w = rotated.shape[:2]
+    if y + h <= img_out.shape[0] and x + w <= img_out.shape[1]:
+        img_out[y:y+h, x:x+w] = np.where(rotated>0, rotated, img_out[y:y+h, x:x+w])
+    return img_out
+
+# ---------------------------
+# Streamlit App
+# ---------------------------
+
+st.title("3D Object Measurement (Width, Length, Depth)")
+
+uploaded_file = st.file_uploader("Upload Image", type=["jpg", "jpeg", "png"])
+relative_heigh_ration = st.selectbox("Relative Height Ratio", ["low", "med", "high", "vhigh"])
+nom_of_objects = st.number_input("Number of Objects", min_value=1, value=1, step=1)
+camh = st.number_input("Camera Height (mm)", min_value=1, value=289, step=1)
+ref_h = st.number_input("Reference Object Height (mm)", min_value=1.0, value=100.0, step=1.0)
+
+if uploaded_file and st.button("Run"):
+    # --- Load and prepare image ---
+    image = Image.open(uploaded_file).convert("RGB")
+    img = np.array(image)
+    img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    initial_image = img_bgr.copy()
+
+    # --- Depth estimation ---
+    st.write("Running depth estimation model...")
+    model_id = "depth-anything/Depth-Anything-V2-Small-hf"
+    processor = AutoImageProcessor.from_pretrained(model_id)
+    model = AutoModelForDepthEstimation.from_pretrained(model_id)
+
+    inputs = processor(images=image, return_tensors="pt")
+    with torch.no_grad():
+        outputs = model(**inputs)
+    result = processor.post_process_depth_estimation(outputs, target_sizes=[(image.height, image.width)])[0]
+    depth = result["predicted_depth"].squeeze().cpu().numpy()
+    depth_norm = (depth - depth.min()) / (depth.max() - depth.min())
+    magma = plt.cm.get_cmap('magma')
+    depth_color = (magma(depth_norm)[:, :, :3] * 255).astype(np.uint8)
+    depth_color = cv2.cvtColor(depth_color, cv2.COLOR_RGB2BGR)
+
+    # --- Histogram analysis ---
+    gray = cv2.cvtColor(depth_color, cv2.COLOR_BGR2GRAY)
+    hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).flatten()
+    smoothed_hist = gaussian_filter1d(hist, sigma=1.89)
+
+    # Bounds
+    if relative_heigh_ration == "low":
+        low_bound = 110
+    elif relative_heigh_ration == "med":
+        low_bound = 100
+    elif relative_heigh_ration == "high":
+        low_bound = 80
     else:
-        x_min = int(np.min(corners[:,:,0
+        low_bound = 60
+
+    derivative = np.gradient(smoothed_hist[low_bound:])
+    zero_crossings = np.where(np.diff(np.sign(derivative)))[0]
+    minima = np.array([i for i in zero_crossings if derivative[i-1] < 0 and derivative[i+1] > 0]).astype(int) + low_bound
+
+    kmeans = KMeans(n_clusters=nom_of_objects, random_state=42)
+    kmeans.fit(minima.reshape(-1,1))
+    centers = np.sort(kmeans.cluster_centers_.reshape(-1))
+
+    # --- Object segmentation ---
+    ret, ground = cv2.threshold(gray, minima[0],255,cv2.THRESH_BINARY)
+    masks = {}
+    if nom_of_objects > 1:
+        for i in range(1, nom_of_objects):
+            _, thresh = cv2.threshold(gray, centers[i], 255, cv2.THRESH_BINARY)
+            binary = cv2.subtract(ground, thresh)
+            masks[i] = small_area_remover(binary)
+        masks[0] = small_area_remover(ground)
+    else:
+        masks[0] = small_area_remover(ground)
+
+    # --- Measurement ---
+    bounding_boxes = []
+    temp = depth_color.copy()
+    img_height = initial_image.shape[0]
+    img_width = initial_image.shape[1]
+
+    for i in range(nom_of_objects):
+        dx, dy, tl_p, br_p = sad(camheight=camh, depthmap=temp, mask=masks[i])
+        x, y = view(dx, dy,
+                    img_width=img_width,
+                    img_height=img_height,
+                    camh=camh,
+                    f=5.42,
+                    viewport=[6.144, 8.6])
+        cv2.circle(temp, tl_p, 5, (0,255,0), 2)
+        cv2.circle(temp, br_p, 5, (0,255,0), 2)
+        cv2.rectangle(temp, tl_p, br_p, (0,255,0), 2)
+        bounding_boxes.append([tl_p, br_p])
+        cv2.putText(temp, f"<Width {int(x)}mm>", (tl_p[0], br_p[1]), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 3)
+        temp = vertical_text(temp, f"<Length {int(y)}mm>", tl_p)
+
+    # --- Depth estimation ---
+    ref = np.mean(depth_color[0:bounding_boxes[0][0][1], 0:bounding_boxes[0][0][0]])
+    mean_vals = []
+    min1 = 255
+    for i in range(nom_of_objects):
+        dcopy = depth_color.copy()
+        m = masks[i] // 255
+        meanint = dcopy[m == 1].mean()
+        if ref < meanint < min1:
+            min1 = meanint
+        mean_vals.append(meanint)
+
+    scaler = float(min1 - ref)
+    for i in range(nom_of_objects):
+        temph = (float(mean_vals[i] - ref) / scaler) * ref_h
+        cv2.putText(temp, f"v Depth {int(temph)}mm v", bounding_boxes[i][0],
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,0), 3)
+
+    # --- Output final image ---
+    st.image(cv2.cvtColor(temp, cv2.COLOR_BGR2RGB), caption="Final Annotated Image", use_container_width=True)
+    st.success("Processing Complete!")
