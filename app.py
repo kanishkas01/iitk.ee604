@@ -58,20 +58,18 @@ if run_process and uploaded_file:
     # ---------------- Histogram & DoG ----------------
     gray = cv2.cvtColor(depth_color, cv2.COLOR_BGR2GRAY)
     hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).flatten()
+
+    # Gaussian smoothed versions for DoG
+    g1 = gaussian_filter1d(hist, sigma=1.0)
+    g2 = gaussian_filter1d(hist, sigma=3.0)
+    dog = g1 - g2  # True Difference of Gaussians
+
+    # Smoothed histogram (for reference)
     smoothed_hist = gaussian_filter1d(hist, sigma=1.89)
 
-    if relative_height_ratio == "low":
-        low_bound = 110
-    elif relative_height_ratio == "med":
-        low_bound = 100
-    elif relative_height_ratio == "high":
-        low_bound = 80
-    else:
-        low_bound = 60
-
-    derivative = np.gradient(smoothed_hist[low_bound:])
-    zero_crossings = np.where(np.diff(np.sign(derivative)))[0]
-    minima = np.array([i for i in zero_crossings if derivative[i - 1] < 0 and derivative[i + 1] > 0]).astype(int) + low_bound
+    # Minima detection on DoG
+    zero_crossings = np.where(np.diff(np.sign(dog)))[0]
+    minima = np.array([i for i in zero_crossings if dog[i - 1] < 0 and dog[i + 1] > 0]).astype(int)
 
     # ---------------- KMeans Segmentation ----------------
     kmeans = KMeans(n_clusters=nom_of_objects, random_state=42)
@@ -124,27 +122,6 @@ if run_process and uploaded_file:
         y = (camh / f) * ty
         return [cx * x, cy * y]
 
-    def vertical_text(img, text, org):
-        x, y = org
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        scale = 1
-        thickness = 3
-        angle = 90
-        (text_w, text_h), baseline = cv2.getTextSize(text, font, scale, thickness)
-        text_img = np.zeros((text_h + baseline, text_w, 3), dtype=np.uint8)
-        cv2.putText(text_img, text, (0, text_h), font, scale, (0, 255, 0), thickness)
-        M = cv2.getRotationMatrix2D((text_w // 2, text_h // 2), angle, 1.0)
-        cos, sin = np.abs(M[0, 0]), np.abs(M[0, 1])
-        nW = int((text_h * sin) + (text_w * cos))
-        nH = int((text_h * cos) + (text_w * sin))
-        M[0, 2] += (nW / 2) - text_w // 2
-        M[1, 2] += (nH / 2) - text_h // 2
-        rotated = cv2.warpAffine(text_img, M, (nW, nH), flags=cv2.INTER_LINEAR, borderValue=(0, 0, 0))
-        h, w = rotated.shape[:2]
-        if y + h <= img.shape[0] and x + w <= img.shape[1]:
-            img[y:y+h, x:x+w] = np.where(rotated > 0, rotated, img[y:y+h, x:x+w])
-        return img
-
     def mean_depth(depth, lt_p, rb_p):
         lx, ly = lt_p
         rx, ry = rb_p
@@ -162,9 +139,8 @@ if run_process and uploaded_file:
         cv2.rectangle(temp, tl_p, br_p, (0, 255, 0), 2)
         bounding_boxes.append([tl_p, br_p])
         results.append({"Object": i + 1, "Width (mm)": int(x), "Length (mm)": int(y)})
-        temp = vertical_text(temp, f"Length {int(y)}mm", tl_p)
-        cv2.putText(temp, f"Width {int(x)}mm", (tl_p[0], br_p[1]),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
+        cv2.putText(temp, f"W:{int(x)}mm L:{int(y)}mm", (tl_p[0], br_p[1]),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
     ref = mean_depth(depth_color, (0, 0), bounding_boxes[0][0])
     mean_val = []
@@ -179,8 +155,6 @@ if run_process and uploaded_file:
 
     for i in range(nom_of_objects):
         temph = (float(mean_val[i] - ref) / scaler) * ref_h
-        cv2.putText(temp, f"Depth {int(temph)}mm",
-                    bounding_boxes[i][0], cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 3)
         results[i]["Depth (mm)"] = int(temph)
 
     # ---------------- Helper Functions ----------------
@@ -222,15 +196,7 @@ if run_process and uploaded_file:
 
     # ---------------- Display Section ----------------
     st.header("Final Annotated Output")
-
     centered_visual(temp, "Figure 1. Final annotated image showing calculated Width, Length, and Depth values for detected objects.")
-
-    # Bounding boxes only
-    bbox_only = depth_color.copy()
-    for i, (tl, br) in enumerate(bounding_boxes):
-        cv2.rectangle(bbox_only, tl, br, (0, 255, 0), 2)
-        cv2.putText(bbox_only, f"Obj {i+1}", (tl[0], br[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
-    centered_visual(bbox_only, "Figure 1B. Detected object bounding boxes before dimension annotation.")
 
     df = pd.DataFrame(results)
     st.markdown("<h5 style='font-size:20px;'>Object Dimension Measurements</h5>", unsafe_allow_html=True)
@@ -244,38 +210,25 @@ if run_process and uploaded_file:
         centered_visual(depth_gray, "Figure 3. Grayscale depth map representing normalized pixel depth values.")
         centered_visual(depth_color, "Figure 4. Colorized depth map using magma colormap for visualizing relative distances.")
 
-    with st.expander("Depth Intensity Histogram", expanded=False):
+    with st.expander("Histogram and DoG Analysis", expanded=False):
         fig_hist, ax_hist = plt.subplots(figsize=(6, 3))
         ax_hist.plot(hist, label="Raw Histogram", alpha=0.6, color='gray')
         ax_hist.plot(smoothed_hist, label="Gaussian Smoothed Histogram", color='red', linewidth=2)
-        ax_hist.set_title("Depth Intensity Distribution")
+        ax_hist.set_title("Depth Intensity Histogram")
         ax_hist.set_xlabel("Pixel Intensity (0–255)")
         ax_hist.set_ylabel("Frequency")
         ax_hist.legend()
         centered_plot(fig_hist, "Figure 5. Raw and smoothed histogram showing intensity distribution of the grayscale depth map.")
 
-    with st.expander("Derivative (DoG) Analysis", expanded=False):
         fig_dog, ax_dog = plt.subplots(figsize=(6, 3))
-        ax_dog.plot(derivative, label="First Derivative (DoG)", color='orange', linewidth=1.5)
-        ax_dog.scatter(minima - low_bound, derivative[minima - low_bound], color='red', label="Detected Minima", zorder=5)
+        ax_dog.plot(dog, label="Difference of Gaussians (DoG)", color='orange', linewidth=1.5)
+        ax_dog.scatter(minima, dog[minima], color='red', label="Detected Minima", zorder=5)
         ax_dog.axhline(0, color='gray', linestyle='--', linewidth=1)
-        ax_dog.set_title("Derivative of Gaussian (DoG) – Edge Detection in Depth Histogram")
-        ax_dog.set_xlabel("Histogram Bin Index (Offset)")
-        ax_dog.set_ylabel("Gradient Magnitude")
+        ax_dog.set_title("Difference of Gaussians (DoG) Analysis")
+        ax_dog.set_xlabel("Pixel Intensity (0–255)")
+        ax_dog.set_ylabel("DoG Value")
         ax_dog.legend()
-        centered_plot(fig_dog, "Figure 6. Derivative of Gaussian showing gradient transitions used for segmentation threshold detection.")
-
-        # Additional minima visualization
-        fig_min, ax_min = plt.subplots(figsize=(6, 3))
-        ax_min.plot(smoothed_hist, color='black', linewidth=2)
-        ax_min.scatter(minima, smoothed_hist[minima], color='red', s=40, label="Detected Minima")
-        for i, m in enumerate(minima):
-            ax_min.text(m, smoothed_hist[m]+max(smoothed_hist)*0.03, f"{i+1}", color='red', ha='center')
-        ax_min.set_title("Detected Minima on Smoothed Histogram")
-        ax_min.set_xlabel("Pixel Intensity")
-        ax_min.set_ylabel("Smoothed Frequency")
-        ax_min.legend()
-        centered_plot(fig_min, "Figure 6B. Located minima points on smoothed histogram showing segmentation thresholds.")
+        centered_plot(fig_dog, "Figure 6. Difference of Gaussians (DoG) showing bandpass-filtered features and detected minima.")
 
     with st.expander("KMeans Clustering Overview", expanded=False):
         fig_km, ax_km = plt.subplots(figsize=(6, 3))
@@ -284,12 +237,11 @@ if run_process and uploaded_file:
         for idx, c in enumerate(centers):
             color = colors[idx % len(colors)]
             ax_km.axvline(x=c, color=color, linestyle='--', linewidth=1.5, label=f"Cluster Center {idx + 1} (Intensity={int(c)})")
-            ax_km.text(c + 3, max(smoothed_hist)*0.05, f"C{idx+1}", color=color, fontsize=10)
-        ax_km.set_title("Cluster-Based Threshold Identification with Labeled Centers")
+        ax_km.set_title("KMeans Cluster Centers over Histogram")
         ax_km.set_xlabel("Pixel Intensity")
         ax_km.set_ylabel("Smoothed Frequency")
         ax_km.legend()
-        centered_plot(fig_km, "Figure 7. KMeans clustering applied to histogram minima for automatic segmentation threshold selection.")
+        centered_plot(fig_km, "Figure 7. KMeans clustering applied on DoG minima for segmentation threshold selection.")
 
     with st.expander("Segmentation and Object Masks", expanded=False):
         centered_visual(ground, "Figure 8. Ground threshold mask after initial binary segmentation.")
