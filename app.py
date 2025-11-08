@@ -183,7 +183,14 @@ if uploaded_file:
         cv2.putText(temp, f"<Width {int(x)}mm>", (tl_p[0], br_p[1]),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 3)
         temp = vertical_text(temp, f"<Length {int(y)}mm>", tl_p)
-ref < meanint < min1:
+
+    ref = mean_depth(depth_color, (0,0), bounding_boxes[0][0])
+    mean_val = []
+    min1 = 255
+    for i in range(nom_of_objects):
+        _01img = masks[i]//255
+        meanint = depth_color[_01img==1].mean()
+        if ref < meanint < min1:
             min1 = meanint
         mean_val.append(meanint)
     scaler = float(min1 - ref)
