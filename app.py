@@ -10,8 +10,19 @@ from sklearn.cluster import KMeans
 
 st.title("3D Object Measurement (Width, Length, Depth)")
 
+# --- Load model once ---
+@st.cache_resource
+def load_model():
+    model_id = "depth-anything/Depth-Anything-V2-Small-hf"
+    processor = AutoImageProcessor.from_pretrained(model_id)
+    model = AutoModelForDepthEstimation.from_pretrained(model_id)
+    return processor, model
+
+processor, model = load_model()
+
 # --- Upload image ---
 uploaded_file = st.file_uploader("Upload Image", type=["jpg", "png", "jpeg"])
+
 if uploaded_file:
     image = Image.open(uploaded_file)
     initial_image = np.array(image.convert("RGB"))
@@ -19,13 +30,17 @@ if uploaded_file:
     img = Image.fromarray(img_rgb)
     st.image(img_rgb, caption="Original Image", use_column_width=True)
 
+    # --- User Inputs (now visible immediately) ---
+    relative_height_ratio = st.selectbox("Relative Height Ratio", ["low", "med", "high", "vhigh"])
+    camh = int(st.number_input("Enter Camera Height (mm)", value=300, step=1))
+    ref_h = int(st.number_input("Enter Reference Object Height (mm)", value=50, step=1))
+    nom_of_objects = int(st.number_input("Number of Objects", value=1, min_value=1, step=1))
+
     # --- Depth Estimation ---
-    model_id = "depth-anything/Depth-Anything-V2-Small-hf"
-    processor = AutoImageProcessor.from_pretrained(model_id)
-    model = AutoModelForDepthEstimation.from_pretrained(model_id)
     inputs = processor(images=img, return_tensors="pt")
     with torch.no_grad():
         outputs = model(**inputs)
+
     post_processed = processor.post_process_depth_estimation(
         outputs, target_sizes=[(img.height, img.width)]
     )
@@ -43,12 +58,6 @@ if uploaded_file:
     depth_color = (plt.cm.magma(depth_norm)[:, :, :3] * 255).astype(np.uint8)
     depth_color = cv2.cvtColor(depth_color, cv2.COLOR_RGB2BGR)
     st.image(depth_color, caption="Colorized Depth Map", use_column_width=True)
-
-    # --- User Inputs ---
-    relative_height_ratio = st.selectbox("Relative Height Ratio", ["low", "med", "high", "vhigh"])
-    camh = int(st.number_input("Enter Camera Height (mm)", value=300, step=1))
-    ref_h = int(st.number_input("Enter Reference Object Height (mm)", value=50, step=1))
-    nom_of_objects = int(st.number_input("Number of Objects", value=1, min_value=1, step=1))
 
     # --- Histogram & Object Masking ---
     gray = cv2.cvtColor(depth_color, cv2.COLOR_BGR2GRAY)
@@ -78,7 +87,7 @@ if uploaded_file:
     derivative = np.gradient(smoothed_hist[low_bound:])
     zero_crossings = np.where(np.diff(np.sign(derivative)))[0]
     minima = np.array(
-        [i for i in zero_crossings if derivative[i-1] < 0 and derivative[i+1] > 0]
+        [i for i in zero_crossings if derivative[i - 1] < 0 and derivative[i + 1] > 0]
     ).astype(int) + low_bound
 
     # --- DoG visualization ---
@@ -91,12 +100,11 @@ if uploaded_file:
     # --- KMeans clustering for multiple objects ---
     kmeans = KMeans(n_clusters=nom_of_objects, random_state=42)
     kmeans.fit(minima.reshape(-1, 1))
-    labels, centers = kmeans.labels_, kmeans.cluster_centers_
-    ascending = np.sort(centers.reshape(len(centers)))
+    centers = np.sort(kmeans.cluster_centers_.reshape(len(kmeans.cluster_centers_)))
 
     # --- Mask creation ---
     def small_area_remover(binary):
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
         output = np.zeros_like(binary)
         if num_labels > 1:
             areas = stats[1:, cv2.CC_STAT_AREA]
@@ -105,12 +113,12 @@ if uploaded_file:
         return output
 
     ground_truth = minima[0]
-    ret, ground = cv2.threshold(gray, ground_truth, 255, cv2.THRESH_BINARY)
+    _, ground = cv2.threshold(gray, ground_truth, 255, cv2.THRESH_BINARY)
     masks = {}
 
     if nom_of_objects > 1:
         for i in range(1, nom_of_objects):
-            _, thresh = cv2.threshold(gray, ascending[i], 255, cv2.THRESH_BINARY)
+            _, thresh = cv2.threshold(gray, centers[i], 255, cv2.THRESH_BINARY)
             binary = ground - thresh
             masks[i] = small_area_remover(binary)
 
@@ -123,11 +131,11 @@ if uploaded_file:
     else:
         masks[0] = small_area_remover(ground)
 
-    # --- Show individual masks ---
+    # --- Show masks ---
     for i, mask in masks.items():
         st.image(mask, caption=f"Object Mask {i+1}", use_column_width=True)
 
-    # --- Helper Functions ---
+    # --- Helper functions ---
     def sad(camheight, depthmap, mask):
         corners = cv2.goodFeaturesToTrack(mask, 10, 0.05, 50)
         corners = np.int32(corners)
@@ -172,15 +180,13 @@ if uploaded_file:
         rx, ry = rb_p
         return np.mean(depth[ly:ry, lx:rx])
 
-    # --- Width, Length, Depth Computation ---
+    # --- Measurement & Display ---
     temp = depth_color.copy()
     bounding_boxes = []
     for i in range(nom_of_objects):
-        dx, dy, tl_p, br_p = sad(camheight=camh, depthmap=temp, mask=masks[i])
+        dx, dy, tl_p, br_p = sad(camh, depth_color, masks[i])
         x, y = view(dx, dy, px=initial_image.shape[0], py=initial_image.shape[1],
                     f=5.42, viewport=[6.144, 8.6], camh=camh)
-        cv2.circle(temp, tl_p, 5, (0, 255, 0), 2)
-        cv2.circle(temp, br_p, 5, (0, 255, 0), 2)
         cv2.rectangle(temp, tl_p, br_p, (0, 255, 0), 2)
         bounding_boxes.append([tl_p, br_p])
         cv2.putText(temp, f"<Width {int(x)}mm>", (tl_p[0], br_p[1]),
