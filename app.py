@@ -46,9 +46,9 @@ if uploaded_file:
 
     # --- User Inputs ---
     relative_height_ratio = st.selectbox("Relative Height Ratio", ["low", "med", "high", "vhigh"])
-    camh = st.number_input("Enter Camera Height (mm)", value=300)
-    ref_h = st.number_input("Enter Reference Object Height (mm)", value=50)
-    nom_of_objects = st.number_input("Number of Objects", value=1, min_value=1)
+    camh = int(st.number_input("Enter Camera Height (mm)", value=300, step=1))
+    ref_h = int(st.number_input("Enter Reference Object Height (mm)", value=50, step=1))
+    nom_of_objects = int(st.number_input("Number of Objects", value=1, min_value=1, step=1))
 
     # --- Histogram & Object Masking ---
     gray = cv2.cvtColor(depth_color, cv2.COLOR_BGR2GRAY)
@@ -73,10 +73,13 @@ if uploaded_file:
         error_rct = 2.91
     elif relative_height_ratio == "vhigh":
         low_bound = 60
+        error_rct = 3.5
 
     derivative = np.gradient(smoothed_hist[low_bound:])
     zero_crossings = np.where(np.diff(np.sign(derivative)))[0]
-    minima = np.array([i for i in zero_crossings if derivative[i-1] < 0 and derivative[i+1] > 0]).astype(int) + low_bound
+    minima = np.array(
+        [i for i in zero_crossings if derivative[i-1] < 0 and derivative[i+1] > 0]
+    ).astype(int) + low_bound
 
     # --- DoG visualization ---
     fig2, ax2 = plt.subplots()
@@ -87,7 +90,7 @@ if uploaded_file:
 
     # --- KMeans clustering for multiple objects ---
     kmeans = KMeans(n_clusters=nom_of_objects, random_state=42)
-    kmeans.fit(minima.reshape(-1,1))
+    kmeans.fit(minima.reshape(-1, 1))
     labels, centers = kmeans.labels_, kmeans.cluster_centers_
     ascending = np.sort(centers.reshape(len(centers)))
 
@@ -124,24 +127,24 @@ if uploaded_file:
     for i, mask in masks.items():
         st.image(mask, caption=f"Object Mask {i+1}", use_column_width=True)
 
-    # --- Functions ---
+    # --- Helper Functions ---
     def sad(camheight, depthmap, mask):
         corners = cv2.goodFeaturesToTrack(mask, 10, 0.05, 50)
         corners = np.int32(corners)
-        x_min = np.min(corners[:,:,0])
-        y_min = np.min(corners[:,:,1])
-        x_max = np.max(corners[:,:,0])
-        y_max = np.max(corners[:,:,1])
+        x_min = np.min(corners[:, :, 0])
+        y_min = np.min(corners[:, :, 1])
+        x_max = np.max(corners[:, :, 0])
+        y_max = np.max(corners[:, :, 1])
         dx = x_max - x_min
         dy = y_max - y_min
         return [dx, dy, (x_min, y_min), (x_max, y_max)]
 
-    def view(dx, dy, px, py, camh=300, f=6.5, viewport=[6.144,8.6], cx=0.82, cy=0.79):
-        tx = (dx/px)*viewport[1]
-        ty = (dy/py)*viewport[0]
-        x = (camh/f)*tx
-        y = (camh/f)*ty
-        return [cx*x, cy*y]
+    def view(dx, dy, px, py, camh=300, f=6.5, viewport=[6.144, 8.6], cx=0.82, cy=0.79):
+        tx = (dx / px) * viewport[1]
+        ty = (dy / py) * viewport[0]
+        x = (camh / f) * tx
+        y = (camh / f) * ty
+        return [cx * x, cy * y]
 
     def vertical_text(img, text, org):
         x, y = org
@@ -151,17 +154,17 @@ if uploaded_file:
         angle = 90
         (text_w, text_h), baseline = cv2.getTextSize(text, font, scale, thickness)
         text_img = np.zeros((text_h + baseline, text_w, 3), dtype=np.uint8)
-        cv2.putText(text_img, text, (0, text_h), font, scale, (0,255,0), thickness)
-        M = cv2.getRotationMatrix2D((text_w//2, text_h//2), angle, 1.0)
-        cos, sin = np.abs(M[0,0]), np.abs(M[0,1])
-        nW = int((text_h*sin) + (text_w*cos))
-        nH = int((text_h*cos) + (text_w*sin))
-        M[0,2] += (nW/2) - text_w//2
-        M[1,2] += (nH/2) - text_h//2
-        rotated = cv2.warpAffine(text_img, M, (nW, nH), flags=cv2.INTER_LINEAR, borderValue=(0,0,0))
+        cv2.putText(text_img, text, (0, text_h), font, scale, (0, 255, 0), thickness)
+        M = cv2.getRotationMatrix2D((text_w // 2, text_h // 2), angle, 1.0)
+        cos, sin = np.abs(M[0, 0]), np.abs(M[0, 1])
+        nW = int((text_h * sin) + (text_w * cos))
+        nH = int((text_h * cos) + (text_w * sin))
+        M[0, 2] += (nW / 2) - text_w // 2
+        M[1, 2] += (nH / 2) - text_h // 2
+        rotated = cv2.warpAffine(text_img, M, (nW, nH), flags=cv2.INTER_LINEAR, borderValue=(0, 0, 0))
         h, w = rotated.shape[:2]
-        if y+h <= img.shape[0] and x+w <= img.shape[1]:
-            img[y:y+h, x:x+w] = np.where(rotated>0, rotated, img[y:y+h, x:x+w])
+        if y + h <= img.shape[0] and x + w <= img.shape[1]:
+            img[y:y + h, x:x + w] = np.where(rotated > 0, rotated, img[y:y + h, x:x + w])
         return img
 
     def mean_depth(depth, lt_p, rb_p):
@@ -169,27 +172,27 @@ if uploaded_file:
         rx, ry = rb_p
         return np.mean(depth[ly:ry, lx:rx])
 
-    # --- Width, Length, Depth ---
+    # --- Width, Length, Depth Computation ---
     temp = depth_color.copy()
     bounding_boxes = []
     for i in range(nom_of_objects):
         dx, dy, tl_p, br_p = sad(camheight=camh, depthmap=temp, mask=masks[i])
         x, y = view(dx, dy, px=initial_image.shape[0], py=initial_image.shape[1],
-                    f=5.42, viewport=[6.144,8.6], camh=camh)
-        cv2.circle(temp, tl_p, 5, (0,255,0), 2)
-        cv2.circle(temp, br_p, 5, (0,255,0), 2)
-        cv2.rectangle(temp, tl_p, br_p, (0,255,0), 2)
+                    f=5.42, viewport=[6.144, 8.6], camh=camh)
+        cv2.circle(temp, tl_p, 5, (0, 255, 0), 2)
+        cv2.circle(temp, br_p, 5, (0, 255, 0), 2)
+        cv2.rectangle(temp, tl_p, br_p, (0, 255, 0), 2)
         bounding_boxes.append([tl_p, br_p])
         cv2.putText(temp, f"<Width {int(x)}mm>", (tl_p[0], br_p[1]),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 3)
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
         temp = vertical_text(temp, f"<Length {int(y)}mm>", tl_p)
 
-    ref = mean_depth(depth_color, (0,0), bounding_boxes[0][0])
+    ref = mean_depth(depth_color, (0, 0), bounding_boxes[0][0])
     mean_val = []
     min1 = 255
     for i in range(nom_of_objects):
-        _01img = masks[i]//255
-        meanint = depth_color[_01img==1].mean()
+        _01img = masks[i] // 255
+        meanint = depth_color[_01img == 1].mean()
         if ref < meanint < min1:
             min1 = meanint
         mean_val.append(meanint)
@@ -198,6 +201,6 @@ if uploaded_file:
     for i in range(nom_of_objects):
         temph = (float(mean_val[i] - ref) / scaler) * ref_h
         cv2.putText(temp, f"v Depth {int(temph)}mm v",
-                    bounding_boxes[i][0], cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,0), 3)
+                    bounding_boxes[i][0], cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 3)
 
     st.image(temp, caption="Final Annotated Image (with Width, Length, Depth)", use_column_width=True)
